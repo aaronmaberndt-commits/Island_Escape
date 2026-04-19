@@ -1,0 +1,10 @@
+#BlueJ class context
+comment0.target=Island3D
+comment0.text=\r\n\ Island3D\ -\ Eine\ 3D\ Insel\ mit\ First-Person-Perspektive\r\n\ F\u00FCr\ BlueJ\ geeignet\ (pure\ Java,\ kein\ externes\ Framework)\r\n\r\n\ Steuerung\:\r\n\ \ \ W\ /\ Pfeil\ hoch\ \ \ \=\ Vorw\u00E4rts\r\n\ \ \ S\ /\ Pfeil\ runter\ \=\ R\u00FCckw\u00E4rts\r\n\ \ \ A\ /\ Pfeil\ links\ \ \=\ Links\ drehen\r\n\ \ \ D\ /\ Pfeil\ rechts\ \=\ Rechts\ drehen\r\n\ \ \ Maus\ ziehen\ \ \ \ \ \ \=\ Umsehen\ (horizontal\ UND\ vertikal)\r\n
+comment1.params=args
+comment1.target=void\ main(java.lang.String[])
+comment2.params=
+comment2.target=Island3D()
+comment3.params=
+comment3.target=void\ toggleFullscreen()
+numComments=4
