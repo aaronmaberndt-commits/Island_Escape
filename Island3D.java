@@ -105,15 +105,52 @@ public class Island3D extends JFrame {
         final double PITCH_MAX =  89.0;
 
         // ── Welt ──────────────────────────────────
-        static final int GRID = 40;
+        static final int GRID = 60;
         float[][] heightMap;
         Color[][] terrainColor;
 
         List<Triangle> triangles      = new ArrayList<>();
         List<Triangle> waterTriangles = new ArrayList<>();
         List<Triangle> shrubTriangles = new ArrayList<>();
+        List<Triangle> treeTriangles  = new ArrayList<>();
+
+        // Baum-Kollision: Stamm-Positionen und -Radien
+        static final int MAX_TREES = 60;
+        double[] treeColX   = new double[MAX_TREES];
+        double[] treeColZ   = new double[MAX_TREES];
+        double[] treeColR   = new double[MAX_TREES];
+        int      treeColCount = 0;
+
+        // Vollständige Baumdaten für Neuaufbau nach dem Fällen
+        double[]  treeWX       = new double[MAX_TREES];
+        double[]  treeWY       = new double[MAX_TREES];
+        double[]  treeWZ       = new double[MAX_TREES];
+        double[]  treeCrownR   = new double[MAX_TREES];
+        double[]  treeCrownH   = new double[MAX_TREES];
+        double[]  treeTrunkH   = new double[MAX_TREES];
+        int[]     treeColorR   = new int[MAX_TREES];
+        int[]     treeColorG   = new int[MAX_TREES];
+        int[]     treeColorB   = new int[MAX_TREES];
+        boolean[] treeAlive    = new boolean[MAX_TREES];
+
+        // Fäll-Feedback
+        String chopMsg   = "";
+        int    chopTimer = 0;
 
         double waterTime = 0;
+        double bobTime   = 0;   // Schaukel-Animation des gehaltenen Items
+        double swingTime = 0;   // Swing beim Hotbar-Wechsel
+        int    lastHotbarSelected = -1;
+
+        // ── Hunger / Sättigung ────────────────────
+        double saturation          = 100.0;
+        static final double SAT_MAX        = 100.0;
+        static final double SAT_DRAIN_WALK = 0.016;  // pro Tick beim Laufen
+        static final double SAT_DRAIN_IDLE = 0.002;  // pro Tick im Stand
+        static final double SAT_JUICE_FILL = 40.0;   // Saft füllt 40 Punkte
+        int    hungerBlinkTimer    = 0;
+        String hungerMsg           = "";
+        int    hungerMsgTimer      = 0;
 
         static final double SCALE = 1.5;
 
@@ -298,6 +335,15 @@ public class Island3D extends JFrame {
                             else { dragSource = -1; dragItem = -1; }
                         }
                     } else {
+                        if (!inventoryOpen && !craftingOpen) {
+                            if (e.getButton() == MouseEvent.BUTTON1) {
+                                // Linksklick → Baum fällen
+                                chopNearbyTree();
+                            } else if (e.getButton() == MouseEvent.BUTTON3) {
+                                // Rechtsklick → Item benutzen (z.B. Saft trinken)
+                                drinkJuice();
+                            }
+                        }
                         lastMouseX = -1; lastMouseY = -1;
                     }
                 }
@@ -343,30 +389,64 @@ public class Island3D extends JFrame {
             heightMap    = new float[GRID + 1][GRID + 1];
             terrainColor = new Color[GRID + 1][GRID + 1];
 
+            // Die Insel belegt die inneren ~40/60 des Grids
+            // Außen: Strand-Ring → dann Ozean
+            final double ISLAND_RADIUS = 0.52;  // normalisierter Abstand bis Inselrand
+            final double BEACH_RADIUS  = 0.68;  // bis hier: Strand
+            final double OCEAN_RADIUS  = 0.72;  // ab hier: tiefer Ozean
+
             for (int z = 0; z <= GRID; z++) {
                 for (int x = 0; x <= GRID; x++) {
                     double nx   = (x - GRID / 2.0) / (GRID / 2.0);
                     double nz   = (z - GRID / 2.0) / (GRID / 2.0);
                     double dist = Math.sqrt(nx * nx + nz * nz);
 
-                    double h = 5.5 * Math.exp(-dist * dist * 2.0);
-                    h += 0.6  * Math.sin(x * 1.3) * Math.cos(z * 1.1);
-                    h += 0.3  * Math.sin(x * 2.7 + z * 1.9);
-                    h += 0.15 * Math.cos(x * 4.1 - z * 3.3);
+                    double h;
 
-                    if (dist > 0.85) h = Math.max(h, -0.5);
+                    if (dist <= ISLAND_RADIUS) {
+                        // ── Insel-Kern (wie bisher, skaliert auf kleineres Gebiet) ──
+                        double localDist = dist / ISLAND_RADIUS; // 0..1 innerhalb der Insel
+                        h  = 5.5 * Math.exp(-localDist * localDist * 2.0);
+                        h += 0.6  * Math.sin(x * 1.3) * Math.cos(z * 1.1);
+                        h += 0.3  * Math.sin(x * 2.7 + z * 1.9);
+                        h += 0.15 * Math.cos(x * 4.1 - z * 3.3);
+                        // Sanftes Abflachen zum Strand hin
+                        double edge = Math.max(0, 1.0 - localDist * localDist * 1.6);
+                        h *= edge;
+                        h = Math.max(h, 0.08); // mind. Strandhöhe am Inselrand
+
+                    } else if (dist <= BEACH_RADIUS) {
+                        // ── Strand-Ring: flach, sandig ──
+                        double t = (dist - ISLAND_RADIUS) / (BEACH_RADIUS - ISLAND_RADIUS); // 0..1
+                        // Strand liegt leicht über Wasser, fällt sanft ins Meer ab
+                        h = 0.12 * (1.0 - t) + (-0.3) * t;
+                        // Kleine Wellen-/Sanddünen-Variation
+                        h += 0.03 * Math.sin(x * 2.1 + z * 1.7);
+
+                    } else {
+                        // ── Ozean: tief unter Wasser ──
+                        double t = Math.min(1.0, (dist - OCEAN_RADIUS) / 0.15);
+                        h = -1.5 - t * 1.5; // bis -3.0 in der Tiefe
+                        // Leichte Meeresbodentextur
+                        h += 0.08 * Math.sin(x * 0.9 + z * 1.3);
+                    }
+
                     heightMap[z][x] = (float) h;
 
-                    if      (h < 0.15) terrainColor[z][x] = new Color(238, 214, 175);
-                    else if (h < 0.9)  terrainColor[z][x] = new Color( 86, 155,  56);
-                    else if (h < 1.8)  terrainColor[z][x] = new Color( 62, 120,  38);
-                    else if (h < 2.6)  terrainColor[z][x] = new Color(140, 120, 100);
-                    else               terrainColor[z][x] = new Color(240, 240, 250);
+                    // Farbe
+                    if      (dist > BEACH_RADIUS)  terrainColor[z][x] = new Color( 30,  65, 130); // Meeresboden
+                    else if (dist > ISLAND_RADIUS) terrainColor[z][x] = new Color(238, 214, 175); // Strand
+                    else if (h < 0.15)             terrainColor[z][x] = new Color(238, 214, 175); // Strandsand
+                    else if (h < 0.9)              terrainColor[z][x] = new Color( 86, 155,  56);
+                    else if (h < 1.8)              terrainColor[z][x] = new Color( 62, 120,  38);
+                    else if (h < 2.6)              terrainColor[z][x] = new Color(140, 120, 100);
+                    else                           terrainColor[z][x] = new Color(240, 240, 250);
                 }
             }
 
             buildTriangles();
             buildShrubs();
+            buildTrees();
             buildGroundItems();
         }
 
@@ -384,7 +464,19 @@ public class Island3D extends JFrame {
                     Color avg2 = avgColor(terrainColor[z][x+1], terrainColor[z+1][x+1], terrainColor[z+1][x]);
                     triangles.add(new Triangle(x0,h00,z0, x1,h10,z0, x0,h01,z1, avg1));
                     triangles.add(new Triangle(x1,h10,z0, x1,h11,z1, x0,h01,z1, avg2));
-                    Color wc = new Color(30, 100, 200, 180);
+
+                    // Wasserfarbe: heller bei Strand, dunkler im tiefen Ozean
+                    double nx = (x - GRID / 2.0) / (GRID / 2.0);
+                    double nz = (z - GRID / 2.0) / (GRID / 2.0);
+                    double dist = Math.sqrt(nx*nx + nz*nz);
+                    Color wc;
+                    if (dist < 0.60) {
+                        wc = new Color(40, 130, 210, 190); // flaches Wasser nahe Strand
+                    } else if (dist < 0.75) {
+                        wc = new Color(25,  95, 185, 200); // mittleres Wasser
+                    } else {
+                        wc = new Color(10,  55, 140, 210); // tiefer Ozean
+                    }
                     waterTriangles.add(new Triangle(x0,0.05,z0, x1,0.05,z0, x0,0.05,z1, wc));
                     waterTriangles.add(new Triangle(x1,0.05,z0, x1,0.05,z1, x0,0.05,z1, wc));
                 }
@@ -409,6 +501,214 @@ public class Island3D extends JFrame {
                 Color bushColorDark  = new Color((int)(r*0.7),(int)(g*0.7),(int)(b*0.7));
                 Color bushColorLight = new Color(Math.min(255,r+40),Math.min(255,g+50),Math.min(255,b+20));
                 addShrub(wx,wy,wz,radius,bushH,new Color(r,g,b),bushColorDark,bushColorLight,rng);
+            }
+        }
+
+        // ──────────────────────────────────────────
+        //  Bäume bauen  (3× Strauch-Größe)
+        // ──────────────────────────────────────────
+        void buildTrees() {
+            treeTriangles.clear();
+            treeColCount = 0;
+            Random rng = new Random(77);
+            int treeCount = 50;
+
+            for (int i = 0; i < treeCount; i++) {
+                int gx = rng.nextInt(GRID), gz = rng.nextInt(GRID);
+                double h = heightMap[gz][gx];
+                if (h < 0.3 || h > 1.8) continue;
+
+                double wx = (gx - GRID / 2.0) * SCALE + rng.nextDouble() * SCALE;
+                double wz = (gz - GRID / 2.0) * SCALE + rng.nextDouble() * SCALE;
+                double wy = sampleHeight(wx, wz);
+
+                double crownRadius = (0.35 + rng.nextDouble() * 0.35) * 3.0;
+                double crownH      = (0.55 + rng.nextDouble() * 0.50) * 4.5;
+                double trunkH      = 2.5  + rng.nextDouble() * 1.5;
+                double trunkR      = 0.18 + crownRadius * 0.08;
+
+                int cr = 20 + rng.nextInt(35);
+                int cg = 90 + rng.nextInt(70);
+                int cb = 10 + rng.nextInt(25);
+
+                if (treeColCount < MAX_TREES) {
+                    int idx = treeColCount;
+                    treeColX[idx]   = wx;
+                    treeColZ[idx]   = wz;
+                    treeColR[idx]   = trunkR + 1.0;
+                    treeWX[idx]     = wx;
+                    treeWY[idx]     = wy;
+                    treeWZ[idx]     = wz;
+                    treeCrownR[idx] = crownRadius;
+                    treeCrownH[idx] = crownH;
+                    treeTrunkH[idx] = trunkH;
+                    treeColorR[idx] = cr;
+                    treeColorG[idx] = cg;
+                    treeColorB[idx] = cb;
+                    treeAlive[idx]  = true;
+                    treeColCount++;
+                }
+
+                Color crownMid   = new Color(cr, cg, cb);
+                Color crownDark  = new Color((int)(cr*0.65),(int)(cg*0.65),(int)(cb*0.65));
+                Color crownLight = new Color(Math.min(255,cr+50),Math.min(255,cg+55),Math.min(255,cb+20));
+                addTree(wx, wy, wz, crownRadius, crownH, trunkH, crownMid, crownDark, crownLight, rng);
+            }
+        }
+
+        /** Baut treeTriangles neu — lässt gefällte Bäume weg. */
+        void rebuildTreeTriangles() {
+            treeTriangles.clear();
+            Random rng = new Random(77); // gleicher Seed → gleiche Farben
+            // RNG auf gleichen Stand bringen wie in buildTrees
+            // (einfacher: Farben aus gespeicherten treeColorR/G/B lesen)
+            for (int i = 0; i < treeColCount; i++) {
+                if (!treeAlive[i]) continue;
+                int cr = treeColorR[i], cg = treeColorG[i], cb = treeColorB[i];
+                Color crownMid   = new Color(cr, cg, cb);
+                Color crownDark  = new Color((int)(cr*0.65),(int)(cg*0.65),(int)(cb*0.65));
+                Color crownLight = new Color(Math.min(255,cr+50),Math.min(255,cg+55),Math.min(255,cb+20));
+                addTree(treeWX[i], treeWY[i], treeWZ[i],
+                        treeCrownR[i], treeCrownH[i], treeTrunkH[i],
+                        crownMid, crownDark, crownLight, rng);
+            }
+        }
+
+        /**
+         * Fällt den nächsten Baum in Reichweite vor dem Spieler.
+         * Nur möglich wenn Axt in der Hand.
+         */
+        /** Trinkt Beerensaft aus dem aktiven Hotbar-Slot und füllt Sättigung auf. */
+        void drinkJuice() {
+            if (hotbarItems[hotbarSelected] != ITEM_SAFT) return;
+            if (saturation >= SAT_MAX) {
+                hungerMsg      = "Du bist nicht hungrig.";
+                hungerMsgTimer = 80;
+                return;
+            }
+            hotbarItems[hotbarSelected] = -1;
+            saturation = Math.min(SAT_MAX, saturation + SAT_JUICE_FILL);
+            hungerMsg      = "Mmm! +" + (int)SAT_JUICE_FILL + " Sättigung";
+            hungerMsgTimer = 100;
+        }
+
+        void chopNearbyTree() {
+            final double REACH = 5.5;
+            double fwdX = Math.sin(Math.toRadians(yaw));
+            double fwdZ = Math.cos(Math.toRadians(yaw));
+
+            int bestIdx = -1;
+            double bestD = Double.MAX_VALUE;
+
+            for (int i = 0; i < treeColCount; i++) {
+                if (!treeAlive[i]) continue;
+                double dx = treeColX[i] - camX;
+                double dz = treeColZ[i] - camZ;
+                double dist = Math.sqrt(dx*dx + dz*dz);
+                if (dist > REACH) continue;
+                double dot = (dx/dist)*fwdX + (dz/dist)*fwdZ;
+                if (dot < 0.2) continue;
+                if (dist < bestD) { bestIdx = i; bestD = dist; }
+            }
+
+            // Kein Baum in Reichweite → gar keine Meldung
+            if (bestIdx < 0) return;
+
+            // Baum in Reichweite, aber keine Axt in der Hand
+            if (hotbarItems[hotbarSelected] != ITEM_AXT) {
+                chopMsg   = "Du brauchst eine Axt!";
+                chopTimer = 90;
+                return;
+            }
+
+            // Baum fällen
+            treeAlive[bestIdx] = false;
+            rebuildTreeTriangles();
+
+            int logs = 2 + (int)(Math.random() * 3);
+            for (int k = 0; k < logs; k++) addToInventory(0);
+
+            chopMsg   = "Baum gefällt! +" + logs + " Holz";
+            chopTimer = 120;
+        }
+
+        /**
+         * Zeichnet einen Baum:
+         *  – Oktagonaler Stamm (trunkH hoch)
+         *  – Kuppelförmige Krone (wie Strauch, aber 3×)
+         */
+        void addTree(double wx, double wy, double wz,
+                     double crownRadius, double crownH, double trunkH,
+                     Color mid, Color dark, Color light, Random rng) {
+
+            double trunkBase = wy;
+            double trunkTop  = wy + trunkH;
+
+            // ── Stamm: Oktagon-Prism (8 Seiten-Flächen + Deckelfläche) ──
+            int tSlices = 8;
+            double tr = 0.18 + crownRadius * 0.08;   // Stammradius proportional zur Krone
+            Color trunkSide  = new Color(101, 67, 33);
+            Color trunkDark  = new Color( 72, 48, 23);
+            Color trunkLight = new Color(130, 88, 45);
+
+            for (int s = 0; s < tSlices; s++) {
+                double a0 = 2 * Math.PI * s       / tSlices;
+                double a1 = 2 * Math.PI * (s + 1) / tSlices;
+                double x0b = wx + Math.cos(a0) * tr, z0b = wz + Math.sin(a0) * tr;
+                double x1b = wx + Math.cos(a1) * tr, z1b = wz + Math.sin(a1) * tr;
+
+                // Vorderseite der Stammfläche (zwei Dreiecke pro Seite)
+                Color face = (s % 2 == 0) ? trunkSide : trunkDark;
+                treeTriangles.add(new Triangle(
+                    x0b, trunkBase, z0b,  x1b, trunkBase, z1b,  x1b, trunkTop, z1b,  face));
+                treeTriangles.add(new Triangle(
+                    x0b, trunkBase, z0b,  x1b, trunkTop,  z1b,  x0b, trunkTop, z0b,  face));
+
+                // Stammdeckel-Fächer
+                treeTriangles.add(new Triangle(
+                    x0b, trunkTop, z0b,  x1b, trunkTop, z1b,  wx, trunkTop, wz,  trunkLight));
+            }
+
+            // ── Krone: untere Kuppelhälfte ──
+            int cSlices = 10;
+            double crownBase = trunkTop;
+            double crownMidY = trunkTop + crownH * 0.55;
+            double crownTopY = trunkTop + crownH;
+
+            for (int s = 0; s < cSlices; s++) {
+                double a0 = 2 * Math.PI * s       / cSlices;
+                double a1 = 2 * Math.PI * (s + 1) / cSlices;
+                double bx0 = wx + Math.cos(a0) * crownRadius * 0.75;
+                double bz0 = wz + Math.sin(a0) * crownRadius * 0.75;
+                double bx1 = wx + Math.cos(a1) * crownRadius * 0.75;
+                double bz1 = wz + Math.sin(a1) * crownRadius * 0.75;
+                double mx0 = wx + Math.cos(a0) * crownRadius;
+                double mz0 = wz + Math.sin(a0) * crownRadius;
+                double mx1 = wx + Math.cos(a1) * crownRadius;
+                double mz1 = wz + Math.sin(a1) * crownRadius;
+                treeTriangles.add(new Triangle(bx0,crownBase,bz0, bx1,crownBase,bz1, mx1,crownMidY,mz1, dark));
+                treeTriangles.add(new Triangle(bx0,crownBase,bz0, mx1,crownMidY,mz1, mx0,crownMidY,mz0, dark));
+            }
+
+            // ── Krone: obere Kuppelhälfte ──
+            for (int s = 0; s < cSlices; s++) {
+                double a0 = 2 * Math.PI * s       / cSlices;
+                double a1 = 2 * Math.PI * (s + 1) / cSlices;
+                double mx0 = wx + Math.cos(a0) * crownRadius;
+                double mz0 = wz + Math.sin(a0) * crownRadius;
+                double mx1 = wx + Math.cos(a1) * crownRadius;
+                double mz1 = wz + Math.sin(a1) * crownRadius;
+                // Zweite Kronenebene für mehr Volumen
+                double mx0s = wx + Math.cos(a0) * crownRadius * 0.55;
+                double mz0s = wz + Math.sin(a0) * crownRadius * 0.55;
+                double mx1s = wx + Math.cos(a1) * crownRadius * 0.55;
+                double mz1s = wz + Math.sin(a1) * crownRadius * 0.55;
+                Color faceCol = (s < cSlices / 2) ? light : mid;
+                treeTriangles.add(new Triangle(mx0,crownMidY,mz0, mx1,crownMidY,mz1, wx,crownTopY,wz, faceCol));
+                // Extra innere Schicht für Tiefenwirkung
+                treeTriangles.add(new Triangle(mx0s,crownMidY+crownH*0.15,mz0s,
+                                               mx1s,crownMidY+crownH*0.15,mz1s,
+                                               wx, crownTopY - crownH*0.1, wz, mid));
             }
         }
 
@@ -505,8 +805,40 @@ public class Island3D extends JFrame {
             if (keyS) { camX -= dx * MOVE_SPEED; camZ -= dz * MOVE_SPEED; }
             if (keyA) { yaw -= TURN_SPEED; }
             if (keyD) { yaw += TURN_SPEED; }
+
+            // ── Baum-Kollision: Spieler aus Stammradius herausschieben ──
+            for (int i = 0; i < treeColCount; i++) {
+                if (!treeAlive[i]) continue;  // gefällter Baum → kein Collider
+                double ddx = camX - treeColX[i];
+                double ddz = camZ - treeColZ[i];
+                double dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                if (dist < treeColR[i] && dist > 0.0001) {
+                    double nx = ddx / dist;
+                    double nz = ddz / dist;
+                    camX = treeColX[i] + nx * treeColR[i];
+                    camZ = treeColZ[i] + nz * treeColR[i];
+                }
+            }
+
             camY = sampleHeight(camX, camZ) + 1.65;
             waterTime += 0.03;
+
+            // Item-Bob: schneller wenn wir laufen
+            boolean moving = keyW || keyS;
+            bobTime += moving ? 0.12 : 0.04;
+
+            // ── Hunger: Sättigung verringern ──
+            double drain = moving ? SAT_DRAIN_WALK : SAT_DRAIN_IDLE;
+            saturation = Math.max(0, saturation - drain);
+            if (saturation <= 20 && saturation > 0) hungerBlinkTimer++;
+            if (hungerMsgTimer > 0) hungerMsgTimer--;
+
+            // Swing beim Hotbar-Wechsel
+            if (hotbarSelected != lastHotbarSelected) {
+                swingTime = 0;
+                lastHotbarSelected = hotbarSelected;
+            }
+            if (swingTime < Math.PI) swingTime += 0.18;
         }
 
         double sampleHeight(double wx, double wz) {
@@ -721,6 +1053,8 @@ public class Island3D extends JFrame {
             y = drawHelpRow(bg, "C",    "Gegenstände aufsammeln", col1X, y); y += 2;
             y = drawHelpRow(bg, "E",    "Inventar öffnen/schließen", col1X, y); y += 2;
             y = drawHelpRow(bg, "Q",    "Crafting-Buch öffnen",  col1X, y); y += 2;
+            y = drawHelpRow(bg, "Klick","Baum fällen (mit Axt)", col1X, y); y += 2;
+            y = drawHelpRow(bg, "R-Klick","Item benutzen / trinken", col1X, y); y += 2;
             y = drawHelpRow(bg, "1–9",  "Hotbar-Slot auswählen", col1X, y); y += 2;
             y = drawHelpRow(bg, "F11",  "Vollbild umschalten",   col1X, y);
 
@@ -822,15 +1156,20 @@ public class Island3D extends JFrame {
             for (Triangle tri : waterTriangles) {
                 double wave = Math.sin(tri.cx * 0.8 + waterTime) * 0.04
                             + Math.cos(tri.cz * 0.6 + waterTime * 0.7) * 0.03;
-                int blue  = Math.min(255, Math.max(100, 180 + (int)(wave * 200)));
-                int green = Math.min(180, Math.max( 60, 100 + (int)(wave * 150)));
+                // Basis-Farbe aus gespeichertem Dreieck, leicht durch Welle moduliert
+                int baseR = tri.color.getRed();
+                int baseG = tri.color.getGreen();
+                int baseB = tri.color.getBlue();
+                int modG  = Math.min(180, Math.max(0, baseG + (int)(wave * 120)));
+                int modB  = Math.min(255, Math.max(0, baseB + (int)(wave * 160)));
                 all.add(new Triangle(tri.x0, tri.y0+wave, tri.z0,
                                      tri.x1, tri.y1+wave, tri.z1,
                                      tri.x2, tri.y2+wave, tri.z2,
-                                     new Color(30,green,blue,200)));
+                                     new Color(baseR, modG, modB, tri.color.getAlpha())));
             }
 
             all.addAll(shrubTriangles);
+            all.addAll(treeTriangles);
 
             Color berryCol  = new Color(200,20,20);
             Color berryDark = new Color(140,10,10);
@@ -886,6 +1225,7 @@ public class Island3D extends JFrame {
             for (Triangle tri : all) projectAndDraw(tri, yawRad, pitchRad);
 
             drawHUD();
+            if (!inventoryOpen && !craftingOpen) drawHeldItem();
             if (inventoryOpen) drawInventory();
             if (craftingOpen)  drawCraftingBook();
         }
@@ -900,7 +1240,7 @@ public class Island3D extends JFrame {
             bg.fillRect(0,0,W,H/2+40);
             bg.setPaint(new GradientPaint(0,H/2-30,new Color(200,230,255,180),0,H/2+30,new Color(200,230,255,0)));
             bg.fillRect(0,H/2-30,W,60);
-            bg.setColor(new Color(20,70,140));
+            bg.setColor(new Color(10, 40, 110));
             bg.fillRect(0,H/2,W,H);
             bg.setColor(new Color(255,240,100,180));
             bg.fillOval(W-140,30,70,70);
@@ -958,6 +1298,230 @@ public class Island3D extends JFrame {
                 c.getAlpha());
         }
 
+        // ──────────────────────────────────────────
+        //  HAND-ITEM 3D-Ansicht
+        // ──────────────────────────────────────────
+        void drawHeldItem() {
+            int selItem = hotbarItems[hotbarSelected];
+            if (selItem < 0) return; // leerer Slot → nichts zeichnen
+
+            // ── Animationsoffsets ──
+            double bob   = Math.sin(bobTime)       * 18.0;  // auf/ab
+            double sway  = Math.sin(bobTime * 0.5) * 10.5;  // links/rechts
+            // Swing-Einflug beim Item-Wechsel: kurzes Einschwingen von unten
+            double swing = Math.sin(swingTime) * 120.0 * Math.max(0, 1.0 - swingTime / Math.PI);
+
+            // Basisposition: rechts unten, korrekt berechnet für 3x-Skala
+            // proj: px = bx + x*120 - z*84,  py = by - y*120 - z*48
+            // Arm-Unterseite (y=-0.12) liegt bei by+14 → knapp unterhalb des Bildschirms
+            // Block-Oberseite (y=0.82)  liegt bei by-113 → sichtbar
+            int baseX = W - 30;
+            int baseY = (int)(H - 30 + bob + swing);
+
+            // ── Arm/Hand zeichnen ──
+            drawHand(baseX, baseY, sway);
+
+            // ── 3D-Modell des Items ──
+            Color itemCol  = MASTER_COLORS[selItem];
+            Color itemDark = itemCol.darker();
+            Color itemLight = itemCol.brighter();
+
+            switch (selItem) {
+                case 0: // Holz → Holzblock
+                    drawHeldBlock(baseX, baseY, sway,
+                        new Color(139,90,43), new Color(100,65,30), new Color(170,115,60));
+                    break;
+                case 1: // Stein (Inventar) → Steinblock
+                    drawHeldBlock(baseX, baseY, sway,
+                        new Color(140,140,140), new Color(100,100,100), new Color(175,175,175));
+                    break;
+                case 2: // Sand → flacher Sandblock
+                    drawHeldBlock(baseX, baseY, sway,
+                        new Color(238,214,175), new Color(200,180,140), new Color(255,235,200));
+                    break;
+                case 3: // Gras → Grasblock
+                    drawHeldGrassBlock(baseX, baseY, sway);
+                    break;
+                case 4: // Wasser → Wasserblock (transparent)
+                    drawHeldBlock(baseX, baseY, sway,
+                        new Color(30,100,200,200), new Color(20,70,150,200), new Color(60,140,230,200));
+                    break;
+                case ITEM_BEERE: // Beere → rote Kugel
+                    drawHeldSphere(baseX, baseY, sway,
+                        new Color(200,20,20), new Color(140,10,10), new Color(230,80,80));
+                    break;
+                case ITEM_STOCK: // Stock → langer Stab
+                    drawHeldStick(baseX, baseY, sway);
+                    break;
+                case ITEM_STEIN: // Stein (Boden) → unregelmäßiger Stein
+                    drawHeldRock(baseX, baseY, sway);
+                    break;
+                case ITEM_AXT: // Axt → Axt-Form
+                    drawHeldAxe(baseX, baseY, sway);
+                    break;
+                case ITEM_SAFT: // Beerensaft → Flasche
+                    drawHeldBottle(baseX, baseY, sway);
+                    break;
+                default: // Fallback: einfacher Block in Itemfarbe
+                    drawHeldBlock(baseX, baseY, sway, itemCol, itemDark, itemLight);
+                    break;
+            }
+        }
+
+        /** Projiziert einen 3D-Punkt in 2D für die Hand-Ansicht (orthogonale Schrägsicht). */
+        int[] proj(double x, double y, double z, int bx, int by, double sway) {
+            // Schrägsicht: X leicht nach rechts, Z nach links-unten, Y nach oben
+            double px = bx + x * 120  - z * 84 + sway;
+            double py = by - y * 120  - z * 48;
+            return new int[]{(int)px, (int)py};
+        }
+
+        /** Zeichnet eine isometrische Box (Quader) für die Hand-Ansicht. */
+        void drawHeldBox(int bx, int by, double sway,
+                         double x0, double y0, double z0,
+                         double x1, double y1, double z1,
+                         Color top, Color front, Color side) {
+            // ── Seiten-Fläche (rechts, sichtbar) ──
+            int[] p000=proj(x0,y0,z0,bx,by,sway), p100=proj(x1,y0,z0,bx,by,sway);
+            int[] p110=proj(x1,y1,z0,bx,by,sway), p010=proj(x0,y1,z0,bx,by,sway);
+            int[] p001=proj(x0,y0,z1,bx,by,sway), p101=proj(x1,y0,z1,bx,by,sway);
+            int[] p111=proj(x1,y1,z1,bx,by,sway), p011=proj(x0,y1,z1,bx,by,sway);
+
+            // Front (z=z1)
+            bg.setColor(front);
+            bg.fillPolygon(new int[]{p001[0],p101[0],p111[0],p011[0]},
+                           new int[]{p001[1],p101[1],p111[1],p011[1]}, 4);
+            // Seite (x=x1)
+            bg.setColor(side);
+            bg.fillPolygon(new int[]{p100[0],p101[0],p111[0],p110[0]},
+                           new int[]{p100[1],p101[1],p111[1],p110[1]}, 4);
+            // Deckel (y=y1)
+            bg.setColor(top);
+            bg.fillPolygon(new int[]{p010[0],p110[0],p111[0],p011[0]},
+                           new int[]{p010[1],p110[1],p111[1],p011[1]}, 4);
+
+            // Kanten
+            bg.setColor(new Color(0,0,0,80));
+            bg.setStroke(new BasicStroke(1f));
+            bg.drawPolygon(new int[]{p001[0],p101[0],p111[0],p011[0]},
+                           new int[]{p001[1],p101[1],p111[1],p011[1]}, 4);
+            bg.drawPolygon(new int[]{p100[0],p101[0],p111[0],p110[0]},
+                           new int[]{p100[1],p101[1],p111[1],p110[1]}, 4);
+            bg.drawPolygon(new int[]{p010[0],p110[0],p111[0],p011[0]},
+                           new int[]{p010[1],p110[1],p111[1],p011[1]}, 4);
+        }
+
+        /** Zeichnet den Arm/Hand als Körperteil. */
+        void drawHand(int bx, int by, double sway) {
+            // Unterarm (ein schmaler Quader)
+            Color skinLight = new Color(220, 175, 130);
+            Color skinMid   = new Color(190, 145, 100);
+            Color skinDark  = new Color(160, 115,  75);
+            drawHeldBox(bx, by, sway,
+                -0.18, -0.12, -0.10,
+                 0.18,  0.12,  0.55,
+                skinMid, skinLight, skinDark);
+        }
+
+        void drawHeldBlock(int bx, int by, double sway, Color top, Color front, Color side) {
+            drawHeldBox(bx, by, sway,
+                -0.5, 0.12, -0.4,
+                 0.3, 0.82,  0.3,
+                top, front, side);
+        }
+
+        void drawHeldGrassBlock(int bx, int by, double sway) {
+            // Erd-Teil
+            drawHeldBox(bx, by, sway,
+                -0.5, 0.12, -0.4,
+                 0.3, 0.62,  0.3,
+                new Color(86,155,56), new Color(139,90,43), new Color(110,70,35));
+            // Gras-Schicht oben
+            drawHeldBox(bx, by, sway,
+                -0.5, 0.62, -0.4,
+                 0.3, 0.82,  0.3,
+                new Color(86,155,56), new Color(70,140,45), new Color(60,130,40));
+        }
+
+        void drawHeldSphere(int bx, int by, double sway, Color mid, Color dark, Color light) {
+            // Kugel aus gestapelten Ellipsen
+            int cx = bx + (int)(-0.1*120 - 0.05*(-84) + sway);
+            int cy = by - (int)(0.5*120 + 0.05*(-48));
+            int rx = 66, ry = 60;
+            bg.setColor(dark);        bg.fillOval(cx-rx,   cy-ry,   rx*2,   ry*2);
+            bg.setColor(mid);         bg.fillOval(cx-rx+9, cy-ry+6, rx*2-15, ry*2-12);
+            bg.setColor(light);       bg.fillOval(cx-rx/2, cy-ry/2, rx/2, ry/2);  // Glanzpunkt
+            bg.setColor(new Color(0,0,0,60));
+            bg.drawOval(cx-rx, cy-ry, rx*2, ry*2);
+        }
+
+        void drawHeldStick(int bx, int by, double sway) {
+            // Langer schräger Stab
+            Color sc  = new Color(120, 75, 30);
+            Color sc2 = new Color(90, 55, 20);
+            Color sc3 = new Color(150, 95, 50);
+            // Stab: dünner langer Quader, diagonal gehalten
+            drawHeldBox(bx, by, sway,
+                -0.07, 0.12, -0.05,
+                 0.07, 1.45,  0.05,
+                sc3, sc, sc2);
+            // Rinde-Textur (zwei Querstreifen)
+            bg.setColor(new Color(80,50,15,120));
+            int[] sp1 = proj(-0.07, 0.5, 0.05, bx, by, sway);
+            int[] sp2 = proj( 0.07, 0.5, 0.05, bx, by, sway);
+            int[] sp3 = proj( 0.07, 0.55, 0.05, bx, by, sway);
+            int[] sp4 = proj(-0.07, 0.55, 0.05, bx, by, sway);
+            bg.fillPolygon(new int[]{sp1[0],sp2[0],sp3[0],sp4[0]},
+                           new int[]{sp1[1],sp2[1],sp3[1],sp4[1]}, 4);
+        }
+
+        void drawHeldRock(int bx, int by, double sway) {
+            Color rc  = new Color(160,160,155);
+            Color rc2 = new Color(120,120,115);
+            Color rc3 = new Color(190,190,185);
+            // Unregelmäßiger Stein: drei überlagerte Box-Schichten
+            drawHeldBox(bx, by, sway, -0.45, 0.12, -0.38, 0.25, 0.65, 0.28, rc3, rc, rc2);
+            drawHeldBox(bx, by, sway, -0.38, 0.55, -0.30, 0.20, 0.82, 0.20, rc, rc2, rc3);
+        }
+
+        void drawHeldAxe(int bx, int by, double sway) {
+            // Stiel
+            Color wood  = new Color(120,75,30);
+            Color wood2 = new Color(90,55,20);
+            Color wood3 = new Color(150,95,50);
+            drawHeldBox(bx, by, sway, -0.06, 0.12, -0.05, 0.06, 1.30, 0.05, wood3, wood, wood2);
+            // Axtkopf (flacher breiter Quader oben)
+            Color metal  = new Color(180,180,180);
+            Color metal2 = new Color(130,130,130);
+            Color metal3 = new Color(210,210,210);
+            drawHeldBox(bx, by, sway, -0.35, 0.95, -0.08, 0.15, 1.35, 0.08, metal3, metal, metal2);
+            // Schneide (dünner Streifen)
+            drawHeldBox(bx, by, sway, -0.38, 1.05, -0.04, -0.28, 1.28, 0.04, metal3, metal3, metal);
+        }
+
+        void drawHeldBottle(int bx, int by, double sway) {
+            // Flaschen-Körper (breiter Quader)
+            Color glass  = new Color(180,30,80,210);
+            Color glass2 = new Color(130,20,55,210);
+            Color glass3 = new Color(210,80,120,210);
+            drawHeldBox(bx, by, sway, -0.22, 0.12, -0.18, 0.18, 0.75, 0.18, glass3, glass, glass2);
+            // Flaschenhals (schmaler)
+            Color neck  = new Color(160,25,65,220);
+            Color neck2 = new Color(120,18,48,220);
+            drawHeldBox(bx, by, sway, -0.10, 0.75, -0.10, 0.06, 1.05, 0.10, neck, neck, neck2);
+            // Korken
+            Color cork = new Color(200,160,100);
+            drawHeldBox(bx, by, sway, -0.09, 1.04, -0.09, 0.05, 1.13, 0.09, cork, cork.darker(), cork.brighter());
+            // Glanz
+            bg.setColor(new Color(255,255,255,60));
+            int[] gl1 = proj(-0.18, 0.35, 0.18, bx, by, sway);
+            int[] gl2 = proj(-0.10, 0.35, 0.18, bx, by, sway);
+            int[] gl3 = proj(-0.10, 0.60, 0.18, bx, by, sway);
+            int[] gl4 = proj(-0.18, 0.60, 0.18, bx, by, sway);
+            bg.fillPolygon(new int[]{gl1[0],gl2[0],gl3[0],gl4[0]},
+                           new int[]{gl1[1],gl2[1],gl3[1],gl4[1]}, 4);
+        }
+
         void drawHUD() {
             int cx=W/2, cy=H/2;
             bg.setColor(new Color(255,255,255,180));
@@ -965,6 +1529,7 @@ public class Island3D extends JFrame {
             bg.setColor(new Color(0,0,0,100));
             bg.drawLine(cx-11,cy,cx+11,cy); bg.drawLine(cx,cy-11,cx,cy+11);
             drawCompass();
+            drawHungerBar();
             drawHotbar();
             if (collectTimer>0) {
                 collectTimer--;
@@ -976,6 +1541,106 @@ public class Island3D extends JFrame {
                 bg.fillRoundRect(mx-10,my-18,mw+20,26,10,10);
                 bg.setColor(new Color(255,80,80,(int)(255*alpha)));
                 bg.drawString(collectMsg,mx,my);
+            }
+            if (chopTimer>0) {
+                chopTimer--;
+                float alpha=Math.min(1f,chopTimer/30f);
+                bg.setFont(new Font("SansSerif",Font.BOLD,16));
+                FontMetrics fm=bg.getFontMetrics();
+                int mw=fm.stringWidth(chopMsg), mx=(W-mw)/2, my=H/2+90;
+                bg.setColor(new Color(0,0,0,(int)(160*alpha)));
+                bg.fillRoundRect(mx-10,my-18,mw+20,26,10,10);
+                bg.setColor(new Color(100,200,60,(int)(255*alpha)));
+                bg.drawString(chopMsg,mx,my);
+            }
+            if (hungerMsgTimer>0) {
+                hungerMsgTimer--;
+                float alpha=Math.min(1f,hungerMsgTimer/30f);
+                bg.setFont(new Font("SansSerif",Font.BOLD,16));
+                FontMetrics fm=bg.getFontMetrics();
+                int mw=fm.stringWidth(hungerMsg), mx=(W-mw)/2, my=H/2+120;
+                bg.setColor(new Color(0,0,0,(int)(160*alpha)));
+                bg.fillRoundRect(mx-10,my-18,mw+20,26,10,10);
+                bg.setColor(new Color(255,180,40,(int)(255*alpha)));
+                bg.drawString(hungerMsg,mx,my);
+            }
+        }
+
+        // ──────────────────────────────────────────
+        //  HUNGERLEISTE
+        // ──────────────────────────────────────────
+        void drawHungerBar() {
+            final int SLOT_SIZE = 52, SLOT_GAP = 4;
+            final int TOTAL_W   = HOTBAR_SLOTS * SLOT_SIZE + (HOTBAR_SLOTS - 1) * SLOT_GAP + 16;
+            final int barX      = (W - TOTAL_W) / 2;
+            final int hotbarY   = H - SLOT_SIZE - 30;
+            final int barY      = hotbarY - 28;
+            final int barW      = TOTAL_W;
+            final int barH      = 14;
+            final int CORNER    = 7;
+
+            double ratio = saturation / SAT_MAX;
+
+            // Blink-Effekt bei niedrigem Hunger (< 20%)
+            boolean showBar = true;
+            if (saturation <= 20 && saturation > 0) {
+                showBar = (hungerBlinkTimer / 15) % 2 == 0;
+            }
+
+            // Hintergrund-Leiste
+            bg.setColor(new Color(0,0,0,160));
+            bg.fillRoundRect(barX-4, barY-4, barW+8, barH+8, CORNER+2, CORNER+2);
+            bg.setColor(new Color(60,30,10,200));
+            bg.fillRoundRect(barX, barY, barW, barH, CORNER, CORNER);
+
+            if (showBar && ratio > 0) {
+                // Farbe je nach Füllstand: grün → gelb → orange → rot
+                Color fillColor;
+                if      (ratio > 0.6) fillColor = new Color(60,  200,  60);
+                else if (ratio > 0.35) fillColor = new Color(210, 180,  20);
+                else if (ratio > 0.15) fillColor = new Color(220, 100,  20);
+                else                   fillColor = new Color(200,  30,  30);
+
+                int fillW = (int)(barW * ratio);
+                bg.setColor(fillColor);
+                bg.fillRoundRect(barX, barY, fillW, barH, CORNER, CORNER);
+
+                // Glanz-Streifen
+                bg.setColor(new Color(255,255,255,50));
+                bg.fillRoundRect(barX+2, barY+2, fillW-4, barH/2-2, CORNER-2, CORNER-2);
+            }
+
+            // Rahmen
+            bg.setColor(new Color(255,255,255,60));
+            bg.setStroke(new BasicStroke(1f));
+            bg.drawRoundRect(barX, barY, barW, barH, CORNER, CORNER);
+
+            // Icon (Gabel/Herz) links neben der Leiste
+            bg.setFont(new Font("SansSerif", Font.BOLD, 13));
+            bg.setColor(new Color(255,200,80,200));
+            bg.drawString("🍴", barX - 22, barY + barH - 1);
+
+            // Prozentzahl mittig
+            bg.setFont(new Font("Monospaced", Font.BOLD, 10));
+            String pct = (int)saturation + "%";
+            FontMetrics fm = bg.getFontMetrics();
+            bg.setColor(new Color(0,0,0,140));
+            bg.drawString(pct, barX + (barW - fm.stringWidth(pct))/2 + 1, barY + barH - 2);
+            bg.setColor(Color.WHITE);
+            bg.drawString(pct, barX + (barW - fm.stringWidth(pct))/2, barY + barH - 3);
+
+            // Warnung bei leerem Hunger
+            if (saturation <= 0) {
+                bg.setFont(new Font("SansSerif", Font.BOLD, 14));
+                fm = bg.getFontMetrics();
+                String warn = "⚠ Hunger! Trink Beerensaft (Rechtsklick)";
+                int wx2 = (W - fm.stringWidth(warn)) / 2;
+                int wy2 = barY - 12;
+                bg.setColor(new Color(0,0,0,160));
+                bg.fillRoundRect(wx2-8, wy2-16, fm.stringWidth(warn)+16, 22, 8, 8);
+                boolean blink = (hungerBlinkTimer / 10) % 2 == 0;
+                bg.setColor(blink ? new Color(255,60,60) : new Color(255,160,40));
+                bg.drawString(warn, wx2, wy2);
             }
         }
 
